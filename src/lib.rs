@@ -4,10 +4,8 @@
 
 use bitmatch::bitmatch;
 use core::unimplemented;
-use embedded_hal as hal;
-use hal::blocking::spi;
+use embedded_hal_async::spi;
 use nb::{self, block};
-use scales::Read;
 
 // Bit pattern definitions for the communication with the hx711. All have to be bitwise negate
 // for the ```invert-sdo``` feature
@@ -71,19 +69,19 @@ pub struct Hx711<SPI> {
     // device specific
     mode: Mode,
 }
-//  needed to satisfy the trait bound in scales
-impl <E, SPI> Read<i32, nb::Error<E>> for Hx711<SPI> 
-where
-SPI: spi::Transfer<u8, Error = E>
-{
-    fn read(&mut self) -> nb::Result<i32, E> {
-        self.read_val()
-    }
-}
+// //  needed to satisfy the trait bound in scales
+// impl<SPI> Read<i32, nb::Error<E>> for Hx711<SPI>
+// where
+// SPI: spi::Transfer<u8, Error = E>
+// {
+//     fn read(&mut self) -> nb::Result<i32, SPI::Error> {
+//         self.read_val()
+//     }
+// }
 
-impl<SPI, E> Hx711<SPI>
+impl<SPI> Hx711<SPI>
 where
-    SPI: spi::Transfer<u8, Error = E>, // + spi::Write<u8, Error = E>,
+    SPI: spi::SpiBus,
 {
     /// opens a connection to a HX711 on a specified SPI.
     ///
@@ -100,14 +98,14 @@ where
     /// reads a value from the HX711 and returns it
     /// # Errors
     /// Returns SPI errors and nb::Error::WouldBlock if data isn't ready to be read from hx711
-    pub fn read_val(&mut self) -> nb::Result<i32, E> {
+    pub async fn read_val(&mut self) -> nb::Result<i32, SPI::Error> {
         // check if data is ready
         // When output data is not ready for retrieval, digital output pin DOUT is high.
         // Serial clock input PD_SCK should be low. When DOUT goes
         // to low, it indicates data is ready for retrieval.
         let mut txrx: [u8; 1] = [SIGNAL_LOW];
 
-        self.spi.transfer(&mut txrx)?;
+        self.spi.transfer_in_place(&mut txrx).await?;
 
         if txrx[0] & 0b01 == 0b01 {
             // as long as the lowest bit is high there is no data waiting
@@ -116,21 +114,21 @@ where
 
         let mut buffer: [u8; 7] = [CLOCK, CLOCK, CLOCK, CLOCK, CLOCK, CLOCK, self.mode as u8];
 
-        self.spi.transfer(&mut buffer)?;
+        self.spi.transfer_in_place(&mut buffer).await?;
 
         Ok(decode_output(&buffer)) // value should be in range 0x800000 - 0x7fffff according to datasheet
     }
 
     #[inline]
     /// This is for compatibility only. Use [read]() instead.
-    pub fn retrieve(&mut self) -> nb::Result<i32, E> {
-        self.read()
+    pub async fn retrieve(&mut self) -> nb::Result<i32, SPI::Error> {
+        self.read_val().await
     }
     /// Reset the chip to it's default state. Mode is set to convert channel A with a gain factor of 128.
     /// # Errors
     /// Returns SPI errors
     #[inline]
-    pub fn reset(&mut self) -> Result<(), E> {
+    pub async fn reset(&mut self) -> Result<(), SPI::Error> {
         // when PD_SCK pin changes from low to high and stays at high for longer than 60µs,
         // HX711 enters power down mode.
         // When PD_SCK returns to low, chip will reset and enter normal operation mode.
@@ -141,7 +139,7 @@ where
 
         let mut buffer: [u8; 301] = RESET_SIGNAL;
 
-        self.spi.transfer(&mut buffer)?;
+        self.spi.transfer_in_place(&mut buffer).await?;
         self.mode = Mode::ChAGain128; // this is the default mode after reset
 
         Ok(())
@@ -151,9 +149,11 @@ where
     /// # Errors
     /// Returns SPI errors
     #[inline]
-    pub fn set_mode(&mut self, m: Mode) -> Result<Mode, E> {
+    pub async fn set_mode(&mut self, m: Mode) -> Result<Mode, SPI::Error> {
         self.mode = m;
-        block!(self.read())?; // read writes Mode for the next read()
+        // potentially an issue for the async runtime, might want a loop with an
+        // explicit yield or sleep
+        block!(self.read_val().await)?; // read writes Mode for the next read()
         Ok(m)
     }
 
@@ -174,7 +174,7 @@ where
     /// the purpose. Therefore it's not implemented.
     // If the SDO pin would be idle high (and at least some MCU's seem to do that in mode 1) then the chip would automatically
     // power down if not used. Cool!
-    pub fn disable(&mut self) -> Result<(), E> {
+    pub fn disable(&mut self) -> Result<(), SPI::Error> {
         // when PD_SCK pin changes from low to high and stays at high for longer than 60µs, HX711 enters power down mode
         // When PD_SCK returns to low, chip will reset and enter normal operation mode.
         // this can't be implemented with SPI because we would have to write a constant stream
@@ -183,7 +183,7 @@ where
     }
 
     /// Power up / down is not implemented (see disable)
-    pub fn enable(&mut self) -> Result<(), E> {
+    pub fn enable(&mut self) -> Result<(), SPI::Error> {
         // when PD_SCK pin changes from low to high and stays at high for longer than 60µs, HX711 enters power down mode
         // When PD_SCK returns to low, chip will reset and enter normal operation mode.
         // this can't be implemented with SPI because we would have to write a constant stream
@@ -226,9 +226,7 @@ mod tests {
     use super::*;
     use test_case::test_case;
     // embedded_hal implementation
-    use embedded_hal_mock::{
-        spi::{Mock as Spi, Transaction as SpiTransaction},
-    };
+    use embedded_hal_mock::spi::{Mock as Spi, Transaction as SpiTransaction};
 
     #[test_case(&[0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55] => 0; "alternating convert to zeros")]
     #[test_case(&[0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA] => -1; "alternating convert to ones")]
@@ -244,15 +242,17 @@ mod tests {
         // Data the mocked up SPI bus should return
         let expectations = [
             SpiTransaction::transfer(vec![SIGNAL_LOW], vec![SIGNAL_LOW]),
-            SpiTransaction::transfer(vec![CLOCK, CLOCK, CLOCK, CLOCK, CLOCK, CLOCK, GAIN128], vec![0x00,0x00,0x00,0x00,0x00,0x00, SIGNAL_LOW]),
+            SpiTransaction::transfer(
+                vec![CLOCK, CLOCK, CLOCK, CLOCK, CLOCK, CLOCK, GAIN128],
+                vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, SIGNAL_LOW],
+            ),
         ];
-    
+
         let spi = Spi::new(&expectations);
         let mut hx711 = Hx711::new(spi);
-    
 
         //hx711.reset()?;
         let v = block!(hx711.read())?;
         assert_eq!(v, 0);
-    }   
+    }
 }
