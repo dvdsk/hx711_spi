@@ -130,7 +130,7 @@ where
             }
 
             // as long as the lowest bit is high there is no data waiting
-            if attempt > 100 {
+            if attempt > 1000 {
                 return Err(Error::NotReadyInTime);
             }
 
