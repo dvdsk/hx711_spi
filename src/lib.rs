@@ -82,6 +82,7 @@ pub struct Hx711<SPI> {
 impl<SPI> Hx711<SPI>
 where
     SPI: spi::SpiBus,
+    SPI::Error: defmt::Format,
 {
     /// opens a connection to a HX711 on a specified SPI.
     ///
