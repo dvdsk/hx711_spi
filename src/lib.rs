@@ -135,7 +135,6 @@ where
             }
 
             attempt += 1;
-            self.delay.delay_us(500).await;
         }
 
         let mut buffer: [u8; 7] = [CLOCK, CLOCK, CLOCK, CLOCK, CLOCK, CLOCK, self.mode as u8];
