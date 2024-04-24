@@ -119,11 +119,6 @@ where
         Ok(decode_output(&buffer)) // value should be in range 0x800000 - 0x7fffff according to datasheet
     }
 
-    #[inline]
-    /// This is for compatibility only. Use [read]() instead.
-    pub async fn retrieve(&mut self) -> nb::Result<i32, SPI::Error> {
-        self.read_val().await
-    }
     /// Reset the chip to it's default state. Mode is set to convert channel A with a gain factor of 128.
     /// # Errors
     /// Returns SPI errors
