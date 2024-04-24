@@ -4,8 +4,8 @@
 
 use bitmatch::bitmatch;
 use core::unimplemented;
+use embedded_hal_async::delay;
 use embedded_hal_async::spi;
-use nb::{self, block};
 
 // Bit pattern definitions for the communication with the hx711. All have to be bitwise negate
 // for the ```invert-sdo``` feature
@@ -49,7 +49,7 @@ const RESET_SIGNAL: [u8; 301] = [0x00; 301];
 
 /// The HX711 has two channels: `A` for the load cell and `B` for AD conversion of other signals.
 /// Channel `A` supports gains of 128 (default) and 64, `B` has a fixed gain of 32.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, defmt::Format)]
 #[repr(u8)]
 pub enum Mode {
     // bits have to be converted for correct transfer 1 -> 10, 0 -> 00
@@ -61,11 +61,24 @@ pub enum Mode {
     ChAGain64 = GAIN64, // there is a typo in the official datasheet: in Fig.2 it says channel B instead of A
 }
 
+#[derive(defmt::Format)]
+pub enum Error<E: defmt::Format> {
+    Spi(E),
+    /// Device took to long to report ready
+    NotReadyInTime,
+}
+
+impl<E: defmt::Format> From<E> for Error<E> {
+    fn from(error: E) -> Self {
+        Self::Spi(error)
+    }
+}
+
 /// Represents an instance of a HX711 device
-#[derive(Debug)]
-pub struct Hx711<SPI> {
-    // SPI specific
+#[derive(defmt::Format)]
+pub struct Hx711<SPI, DELAY> {
     spi: SPI,
+    delay: DELAY,
     // device specific
     mode: Mode,
 }
@@ -79,8 +92,9 @@ pub struct Hx711<SPI> {
 //     }
 // }
 
-impl<SPI> Hx711<SPI>
+impl<SPI, DELAY> Hx711<SPI, DELAY>
 where
+    DELAY: delay::DelayNs,
     SPI: spi::SpiBus,
     SPI::Error: defmt::Format,
 {
@@ -89,9 +103,10 @@ where
     /// The datasheet specifies PD_SCK high time and PD_SCK low time to be in the 0.2 to 50 us range,
     /// therefore bus speed has to be between 5 MHz and 20 kHz. 1 MHz seems to be a good choice.
     /// D is an embedded_hal implementation of DelayMs.
-    pub fn new(spi: SPI) -> Self {
+    pub fn new(spi: SPI, delay: DELAY) -> Self {
         Hx711 {
             spi,
+            delay,
             mode: Mode::ChAGain128,
         }
     }
@@ -99,7 +114,7 @@ where
     /// reads a value from the HX711 and returns it
     /// # Errors
     /// Returns SPI errors and nb::Error::WouldBlock if data isn't ready to be read from hx711
-    pub async fn read_val(&mut self) -> nb::Result<i32, SPI::Error> {
+    pub async fn read_val(&mut self) -> Result<i32, Error<SPI::Error>> {
         // check if data is ready
         // When output data is not ready for retrieval, digital output pin DOUT is high.
         // Serial clock input PD_SCK should be low. When DOUT goes
@@ -108,9 +123,19 @@ where
 
         self.spi.transfer_in_place(&mut txrx).await?;
 
-        if txrx[0] & 0b01 == 0b01 {
+        let mut attempt = 0;
+        loop {
+            if txrx[0] & 0b01 != 0b01 {
+                break;
+            }
+
             // as long as the lowest bit is high there is no data waiting
-            return Err(nb::Error::WouldBlock);
+            if attempt > 100 {
+                return Err(Error::NotReadyInTime);
+            }
+
+            attempt += 1;
+            self.delay.delay_us(500).await;
         }
 
         let mut buffer: [u8; 7] = [CLOCK, CLOCK, CLOCK, CLOCK, CLOCK, CLOCK, self.mode as u8];
@@ -145,11 +170,11 @@ where
     /// # Errors
     /// Returns SPI errors
     #[inline]
-    pub async fn set_mode(&mut self, m: Mode) -> Result<Mode, SPI::Error> {
+    pub async fn set_mode(&mut self, m: Mode) -> Result<Mode, Error<SPI::Error>> {
         self.mode = m;
         // potentially an issue for the async runtime, might want a loop with an
         // explicit yield or sleep
-        block!(self.read_val().await)?; // read writes Mode for the next read()
+        self.read_val().await?; // read writes Mode for the next read()
         Ok(m)
     }
 
